@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Serve files using the version 1 Binary Content Protocol."""
+
+from __future__ import annotations
+
+import argparse
+import mimetypes
+from pathlib import Path
+import socket
+import struct
+import threading
+from urllib.parse import unquote
+
+
+FIXED = struct.Struct("!2sBBBBHI")
+MAX_PAYLOAD = 8 * 1024 * 1024
+NAMES = {
+    1: ":method", 2: ":path", 3: "host", 4: "user-agent", 5: "accept",
+    6: ":status", 7: "content-length", 8: "content-type", 9: "server",
+    10: "connection",
+}
+INDEX = {name: code for code, name in NAMES.items()}
+
+
+class BadFrame(Exception):
+    pass
+
+
+def exact(sock: socket.socket, amount: int, *, boundary: bool = False) -> bytes | None:
+    chunks = bytearray()
+    while len(chunks) < amount:
+        part = sock.recv(amount - len(chunks))
+        if not part:
+            if boundary and not chunks:
+                return None
+            raise BadFrame("truncated frame")
+        chunks.extend(part)
+    return bytes(chunks)
+
+
+def read_frame(sock: socket.socket) -> tuple[int, int, dict[str, str], bytes] | None:
+    fixed = exact(sock, FIXED.size, boundary=True)
+    if fixed is None:
+        return None
+    magic, version, kind, flags, count, stream, size = FIXED.unpack(fixed)
+    if magic != b"BC" or version != 1 or size > MAX_PAYLOAD:
+        raise BadFrame("invalid magic, version, or payload length")
+    payload = exact(sock, size)
+    assert payload is not None
+    # The payload length is authoritative even for types added in a later version.
+    if kind != 1:
+        return kind, stream, {}, payload
+    if flags != 1:
+        raise BadFrame("invalid request flags")
+    headers: dict[str, str] = {}
+    pos = 0
+    for _ in range(count):
+        if pos >= size:
+            raise BadFrame("truncated header block")
+        code = payload[pos]
+        pos += 1
+        if code == 0:
+            if pos >= size:
+                raise BadFrame("missing name length")
+            width = payload[pos]
+            pos += 1
+            if width == 0 or pos + width > size:
+                raise BadFrame("invalid literal name")
+            try:
+                name = payload[pos:pos + width].decode("ascii")
+            except UnicodeDecodeError as error:
+                raise BadFrame("name is not ASCII") from error
+            pos += width
+            if not name or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in name):
+                raise BadFrame("invalid literal name")
+        else:
+            if code not in NAMES:
+                raise BadFrame("unknown name code")
+            name = NAMES[code]
+        if pos + 2 > size:
+            raise BadFrame("missing value length")
+        width = int.from_bytes(payload[pos:pos + 2], "big")
+        pos += 2
+        if pos + width > size:
+            raise BadFrame("truncated value")
+        try:
+            value = payload[pos:pos + width].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise BadFrame("value is not UTF-8") from error
+        pos += width
+        if name in headers:
+            raise BadFrame("duplicate header")
+        headers[name] = value
+    return kind, stream, headers, payload[pos:]
+
+
+def reply(stream: int, status: int, body: bytes, content_type: str = "text/plain; charset=utf-8", close: bool = False) -> bytes:
+    fields = (
+        (":status", str(status)),
+        ("content-length", str(len(body))),
+        ("content-type", content_type),
+        ("server", "bserve/1.0"),
+        ("connection", "close" if close else "keep-alive"),
+    )
+    payload = bytearray()
+    for name, value in fields:
+        encoded = value.encode("utf-8")
+        payload.append(INDEX[name])
+        payload.extend(len(encoded).to_bytes(2, "big"))
+        payload.extend(encoded)
+    payload.extend(body)
+    if len(payload) > MAX_PAYLOAD:
+        raise BadFrame("file exceeds frame limit")
+    return FIXED.pack(b"BC", 1, 2, 1, len(fields), stream, len(payload)) + payload
+
+
+def mapped_file(root: Path, target: str) -> Path | None:
+    root = root.resolve()
+    if not target.startswith("/") or "#" in target:
+        return None
+    raw_path = target.partition("?")[0]
+    for i, char in enumerate(raw_path):
+        if char == "%" and (i + 2 >= len(raw_path) or any(c not in "0123456789abcdefABCDEF" for c in raw_path[i + 1:i + 3])):
+            return None
+    try:
+        decoded = unquote(raw_path, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if "\x00" in decoded or "\\" in decoded or "//" in decoded:
+        return None
+    parts = decoded.split("/")[1:]
+    if any(part in (".", "..") for part in parts):
+        return None
+    candidate = (root / Path(*filter(None, parts))).resolve()
+    if not candidate.is_relative_to(root):
+        return None
+    return candidate / "index.html" if candidate.is_dir() else candidate
+
+
+def answer(root: Path, stream: int, headers: dict[str, str], body: bytes) -> bytes:
+    if stream == 0:
+        return reply(0, 400, b"request stream id must be nonzero\n", close=True)
+    if body or not {":method", ":path", "host"} <= headers.keys() or not headers.get("host"):
+        return reply(stream, 400, b"malformed request\n")
+    if headers[":method"] != "GET":
+        return reply(stream, 405, b"only GET is supported\n")
+    path = mapped_file(root, headers[":path"])
+    if path is None:
+        return reply(stream, 400, b"unsafe path\n")
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return reply(stream, 404, b"file not found\n")
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    if media_type.startswith("text/"):
+        media_type += "; charset=utf-8"
+    try:
+        return reply(stream, 200, content, media_type)
+    except BadFrame:
+        return reply(stream, 400, b"file exceeds frame limit\n")
+
+
+def handle_connection(sock: socket.socket, root: Path) -> None:
+    sock.settimeout(15)
+    try:
+        while True:
+            try:
+                frame = read_frame(sock)
+            except BadFrame as error:
+                sock.sendall(reply(0, 400, (str(error) + "\n").encode(), close=True))
+                return
+            if frame is None:
+                return
+            kind, stream, headers, body = frame
+            if kind != 1:
+                continue
+            response = answer(root, stream, headers, body)
+            sock.sendall(response)
+            if stream == 0:
+                return
+    except (OSError, socket.timeout):
+        return
+    finally:
+        sock.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="BCP static-file server")
+    parser.add_argument("root", type=Path)
+    parser.add_argument("port", type=int)
+    parser.add_argument("--host", default="127.0.0.1")
+    args = parser.parse_args()
+    root = args.root.resolve()
+    if not root.is_dir():
+        parser.error(f"not a directory: {root}")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((args.host, args.port))
+            listener.listen()
+            print(f"serving {root} on {args.host}:{listener.getsockname()[1]}", flush=True)
+            while True:
+                sock, _ = listener.accept()
+                threading.Thread(target=handle_connection, args=(sock, root), daemon=True).start()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

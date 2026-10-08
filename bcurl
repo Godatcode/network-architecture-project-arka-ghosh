@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Fetch BCP resources over one TCP connection."""
+
+from __future__ import annotations
+
+import argparse
+import socket
+import struct
+import sys
+from urllib.parse import urlsplit
+
+
+HEADER = struct.Struct("!2sBBBBHI")
+TABLE = {
+    1: ":method", 2: ":path", 3: "host", 4: "user-agent", 5: "accept",
+    6: ":status", 7: "content-length", 8: "content-type", 9: "server",
+    10: "connection",
+}
+
+
+class WireError(Exception):
+    pass
+
+
+def target_parts(target: str) -> tuple[str, int, str]:
+    parsed = urlsplit(target if "://" in target else "bcp://" + target)
+    if parsed.scheme != "bcp" or not parsed.hostname or parsed.fragment:
+        raise ValueError(f"invalid BCP target: {target}")
+    try:
+        port = parsed.port if parsed.port is not None else 9000
+    except ValueError as error:
+        raise ValueError(f"invalid port: {target}") from error
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    return parsed.hostname, port, path
+
+
+def make_request(host: str, port: int, path: str, stream: int) -> bytes:
+    fields = (
+        (1, "GET"), (2, path), (3, f"{host}:{port}"),
+        (4, "bcurl/1.0"), (5, "*/*"),
+    )
+    payload = bytearray()
+    for code, value in fields:
+        encoded = value.encode("utf-8")
+        if len(encoded) > 65535:
+            raise WireError("request header value is too long")
+        payload.extend((code,))
+        payload.extend(struct.pack("!H", len(encoded)))
+        payload.extend(encoded)
+    if len(payload) > 8 * 1024 * 1024:
+        raise WireError("request payload is too large")
+    return HEADER.pack(b"BC", 1, 1, 1, len(fields), stream, len(payload)) + payload
+
+
+def take(sock: socket.socket, count: int, *, at_start: bool = False) -> bytes | None:
+    result = bytearray()
+    while len(result) != count:
+        chunk = sock.recv(count - len(result))
+        if not chunk:
+            if at_start and not result:
+                return None
+            raise WireError("connection closed inside a frame")
+        result += chunk
+    return bytes(result)
+
+
+def read_response(sock: socket.socket) -> tuple[int, int, dict[str, str], bytes, bytes]:
+    fixed = take(sock, HEADER.size, at_start=True)
+    if fixed is None:
+        raise WireError("server closed before the response")
+    magic, version, kind, flags, count, stream, length = HEADER.unpack(fixed)
+    if magic != b"BC" or version != 1 or length > 8 * 1024 * 1024:
+        raise WireError("invalid fixed frame header")
+    payload = take(sock, length)
+    assert payload is not None
+    raw = fixed + payload
+    if kind != 2:
+        # An extension frame is opaque. Its length has already located the next frame.
+        return kind, stream, {}, b"", raw
+    if flags != 1:
+        raise WireError("invalid response flags")
+    values: dict[str, str] = {}
+    cursor = 0
+    for _ in range(count):
+        if cursor == length:
+            raise WireError("header block ended early")
+        code = payload[cursor]
+        cursor += 1
+        if code == 0:
+            if cursor == length:
+                raise WireError("literal name length is missing")
+            name_size = payload[cursor]
+            cursor += 1
+            if not name_size or cursor + name_size > length:
+                raise WireError("invalid literal name")
+            try:
+                name = payload[cursor:cursor + name_size].decode("ascii")
+            except UnicodeDecodeError as error:
+                raise WireError("literal name is not ASCII") from error
+            cursor += name_size
+            if any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in name):
+                raise WireError("invalid literal name")
+        else:
+            if code not in TABLE:
+                raise WireError("unknown static name code")
+            name = TABLE[code]
+        if cursor + 2 > length:
+            raise WireError("value length is missing")
+        value_size = int.from_bytes(payload[cursor:cursor + 2], "big")
+        cursor += 2
+        if cursor + value_size > length:
+            raise WireError("header value ended early")
+        try:
+            value = payload[cursor:cursor + value_size].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise WireError("header value is not UTF-8") from error
+        cursor += value_size
+        if name in values:
+            raise WireError("duplicate response header")
+        values[name] = value
+    return kind, stream, values, payload[cursor:], raw
+
+
+def dump(label: str, data: bytes) -> None:
+    print(label, file=sys.stderr)
+    for offset in range(0, len(data), 16):
+        part = data[offset:offset + 16]
+        hex_bytes = " ".join(f"{byte:02x}" for byte in part)
+        printable = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in part)
+        print(f"{offset:04x}  {hex_bytes:<47}  |{printable}|", file=sys.stderr)
+
+
+def run(targets: list[str], verbose: bool) -> int:
+    destinations = [target_parts(target) for target in targets]
+    if len({(host, port) for host, port, _ in destinations}) != 1:
+        raise ValueError("all targets must use one host and port")
+    if len(destinations) > 65535:
+        raise ValueError("too many targets for 16-bit stream IDs")
+    host, port, _ = destinations[0]
+    result = 0
+    with socket.create_connection((host, port), timeout=10) as sock:
+        sock.settimeout(10)
+        for stream, (_, _, path) in enumerate(destinations, 1):
+            outgoing = make_request(host, port, path, stream)
+            if verbose:
+                dump(f"> request stream {stream} ({len(outgoing)} bytes)", outgoing)
+            sock.sendall(outgoing)
+            while True:
+                kind, received_stream, fields, body, raw = read_response(sock)
+                if verbose:
+                    dump(f"< frame type {kind} stream {received_stream} ({len(raw)} bytes)", raw)
+                if kind == 2:
+                    break
+            if received_stream != stream:
+                raise WireError(f"response stream {received_stream} does not match {stream}")
+            required = {":status", "content-length", "content-type", "server", "connection"}
+            if not required <= fields.keys():
+                raise WireError("response is missing a required header")
+            status_text = fields[":status"]
+            length_text = fields["content-length"]
+            if not (len(status_text) == 3 and status_text.isascii() and status_text.isdecimal()):
+                raise WireError("invalid response status")
+            if not length_text.isascii() or not length_text.isdecimal():
+                raise WireError("invalid content-length")
+            if int(length_text) != len(body):
+                raise WireError("content-length does not match the body")
+            status = int(status_text)
+            if verbose:
+                for name, value in fields.items():
+                    print(f"< {name}: {value}", file=sys.stderr)
+            sys.stdout.buffer.write(body)
+            sys.stdout.buffer.flush()
+            if 400 <= status <= 599:
+                result = 22
+            if fields["connection"] == "close" and stream != len(destinations):
+                raise WireError("server closed before all targets were fetched")
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="BCP command-line client")
+    parser.add_argument("-v", "--verbose", action="store_true", help="hexdump every sent and received frame")
+    parser.add_argument("targets", nargs="+", help="host:port/path")
+    args = parser.parse_args()
+    try:
+        raise SystemExit(run(args.targets, args.verbose))
+    except (OSError, WireError, ValueError) as error:
+        print(f"bcurl: {error}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()

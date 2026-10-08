@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+Reference/
+Network-Architecture-Assignment-2-submission.zip
+tmp/
